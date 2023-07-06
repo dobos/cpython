@@ -94,7 +94,7 @@ class MaybeEncodingError(Exception):
         return "<%s: %s>" % (self.__class__.__name__, self)
 
 
-def worker(inqueue, outqueue, initializer=None, initargs=(), maxtasks=None,
+def worker(outstanding, inqueue, outqueue, initializer=None, initargs=(), maxtasks=None,
            wrap_exception=False):
     if (maxtasks is not None) and not (isinstance(maxtasks, int)
                                        and maxtasks >= 1):
@@ -120,6 +120,11 @@ def worker(inqueue, outqueue, initializer=None, initargs=(), maxtasks=None,
             util.debug('worker got sentinel -- exiting')
             break
 
+        # put task in temporary queue to mark it as being executed
+        # when the worker dies unexpectedly we will be able to report
+        # an error
+        outstanding.put(task)
+
         job, i, func, args, kwds = task
         try:
             result = (True, func(*args, **kwds))
@@ -134,6 +139,9 @@ def worker(inqueue, outqueue, initializer=None, initargs=(), maxtasks=None,
             util.debug("Possible encoding error while sending result: %s" % (
                 wrapped))
             put((job, i, (False, wrapped)))
+
+        # task handled gracefully, remove from outstanding
+        outstanding.get()
 
         task = job = result = func = args = kwds = None
         completed += 1
@@ -184,7 +192,9 @@ class Pool(object):
                  maxtasksperchild=None, context=None):
         # Attributes initialized early to make sure that they exist in
         # __del__() if __init__() raises an exception
+        self._lock = threading.Lock()
         self._pool = []
+        self._outstanding = []
         self._state = INIT
 
         self._ctx = context or get_context()
@@ -226,7 +236,8 @@ class Pool(object):
         self._worker_handler = threading.Thread(
             target=Pool._handle_workers,
             args=(self._cache, self._taskqueue, self._ctx, self.Process,
-                  self._processes, self._pool, self._inqueue, self._outqueue,
+                  self._processes, self._lock, self._pool, self._outstanding,
+                  self._inqueue, self._outqueue,
                   self._initializer, self._initargs, self._maxtasksperchild,
                   self._wrap_exception, sentinels, self._change_notifier)
             )
@@ -287,59 +298,90 @@ class Pool(object):
                 workers if hasattr(worker, "sentinel")]
 
     @staticmethod
-    def _join_exited_workers(pool):
+    def _join_exited_workers(lock, pool, outstanding, outqueue):
         """Cleanup after any worker processes which have exited due to reaching
         their specified lifetime.  Returns True if any workers were cleaned up.
         """
-        cleaned = False
-        for i in reversed(range(len(pool))):
-            worker = pool[i]
-            if worker.exitcode is not None:
-                # worker exited
-                util.debug('cleaning up worker %d' % i)
-                worker.join()
-                cleaned = True
-                del pool[i]
-        return cleaned
+        with lock:
+            cleaned = False
+            for i in reversed(range(len(pool))):
+                worker = pool[i]
+                tasks = outstanding[i]
+                if worker.exitcode is not None:
+                    # worker exited
+                    util.debug('cleaning up worker %d' % i)
+                    worker.join()
+
+                    # verify if there are any outstanding jobs associated
+                    # with this worker
+                    if not tasks.empty():
+                        util.debug('exited worker %d has outstanding job' % i)
+                        task = tasks.get()
+                        if task is not None:
+                            job, j, func, args, kwds = task
+                            result = (False, Exception(f"Pool worker process {i} with pid={worker.pid} exited unexpectedly at job={job}, i={j}"))
+                            try:
+                                outqueue.put((job, j, result))
+                            except Exception as e:
+                                wrapped = MaybeEncodingError(e, result[1])
+                                util.debug("Possible encoding error while sending result: %s" % (
+                                    wrapped))
+                                outqueue.put((job, j, (False, wrapped)))
+                    
+                    tasks.close()
+
+                    cleaned = True
+                    del pool[i]
+                    del outstanding[i]
+            return cleaned
 
     def _repopulate_pool(self):
         return self._repopulate_pool_static(self._ctx, self.Process,
                                             self._processes,
-                                            self._pool, self._inqueue,
-                                            self._outqueue, self._initializer,
+                                            self._lock,
+                                            self._pool,
+                                            self._outstanding,
+                                            self._inqueue,
+                                            self._outqueue,
+                                            self._initializer,
                                             self._initargs,
                                             self._maxtasksperchild,
                                             self._wrap_exception)
 
     @staticmethod
-    def _repopulate_pool_static(ctx, Process, processes, pool, inqueue,
-                                outqueue, initializer, initargs,
+    def _repopulate_pool_static(ctx, Process, processes, lock, pool,
+                                outstanding, inqueue, outqueue,
+                                initializer, initargs,
                                 maxtasksperchild, wrap_exception):
         """Bring the number of pool processes up to the specified number,
         for use after reaping workers which have exited.
         """
-        for i in range(processes - len(pool)):
-            w = Process(ctx, target=worker,
-                        args=(inqueue, outqueue,
-                              initializer,
-                              initargs, maxtasksperchild,
-                              wrap_exception))
-            w.name = w.name.replace('Process', 'PoolWorker')
-            w.daemon = True
-            w.start()
-            pool.append(w)
-            util.debug('added worker')
+        with lock:
+            for i in range(processes - len(pool)):
+                o = ctx.SimpleQueue()
+                w = Process(ctx, target=worker,
+                            args=(o, inqueue, outqueue,
+                                initializer,
+                                initargs, maxtasksperchild,
+                                wrap_exception))
+                w.name = w.name.replace('Process', 'PoolWorker')
+                w.daemon = True
+                w.start()
+                pool.append(w)
+                outstanding.append(o)
+                util.debug('added worker')
 
     @staticmethod
-    def _maintain_pool(ctx, Process, processes, pool, inqueue, outqueue,
+    def _maintain_pool(ctx, Process, processes, lock, pool, 
+                       outstanding, inqueue, outqueue,
                        initializer, initargs, maxtasksperchild,
                        wrap_exception):
         """Clean up any exited workers and start replacements for them.
         """
-        if Pool._join_exited_workers(pool):
-            Pool._repopulate_pool_static(ctx, Process, processes, pool,
-                                         inqueue, outqueue, initializer,
-                                         initargs, maxtasksperchild,
+        if Pool._join_exited_workers(lock, pool, outstanding, outqueue):
+            Pool._repopulate_pool_static(ctx, Process, processes, lock, pool,
+                                         outstanding, inqueue, outqueue,
+                                         initializer, initargs, maxtasksperchild,
                                          wrap_exception)
 
     def _setup_queues(self):
@@ -505,17 +547,20 @@ class Pool(object):
 
     @classmethod
     def _handle_workers(cls, cache, taskqueue, ctx, Process, processes,
-                        pool, inqueue, outqueue, initializer, initargs,
+                        lock, pool, outstanding, inqueue, outqueue,
+                        initializer, initargs,
                         maxtasksperchild, wrap_exception, sentinels,
                         change_notifier):
+        
         thread = threading.current_thread()
 
         # Keep maintaining workers until the cache gets drained, unless the pool
         # is terminated.
         while thread._state == RUN or (cache and thread._state != TERMINATE):
-            cls._maintain_pool(ctx, Process, processes, pool, inqueue,
-                               outqueue, initializer, initargs,
-                               maxtasksperchild, wrap_exception)
+            cls._maintain_pool(ctx, Process, processes, lock, pool, 
+                            outstanding, inqueue, outqueue,
+                            initializer, initargs,
+                            maxtasksperchild, wrap_exception)
 
             current_sentinels = [*cls._get_worker_sentinels(pool), *sentinels]
 
